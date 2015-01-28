@@ -1,5 +1,5 @@
 # -*- coding: iso-8859-15 -*-
-# Copyright (C) 2013 Martin Glueck All rights reserved
+# Copyright (C) 2013-2015 Martin Glueck All rights reserved
 # Langstrasse 4, A--2244 Spannberg, Austria. martin@mangari.org
 # #*** <License> ************************************************************#
 # This module is part of the library selfbus.
@@ -32,9 +32,19 @@
 
 from   __future__ import division, print_function
 from   __future__ import absolute_import, unicode_literals
+from   collections import OrderedDict as OD
 
 #from     sqlalchemy import create_engine, Table, Column
-import   sqlalchemy
+#import   sqlalchemy
+
+def no_to_col (i) :
+    result = ""
+    if i > 26 :
+        result += chr (ord ("A") + (i // 26) - 1)
+        i -= (i // 26) * 26
+    result += chr (ord ("A") + i - 1)
+    return result
+# end def no_to_col
 
 class Column (object) :
     """A column of a table"""
@@ -117,12 +127,70 @@ class Table (object) :
             line = file.readline ()
             result [c.name] = c.python_value (line)
         self.data.append (result)
-    # end def
+    # end def add_row
 
     def create (self, metadata) :
         columns   = [c.create () for c in self.columns]
         self._sql = sqlalchemy.Table ("%03d_%s" % (int (self.number), self.name), metadata, * columns)
     # end def create
+
+    def create_excel (self, doc, i) :
+        try :
+            sheet = doc.Sheets [i]
+        except :
+            sheet = doc.Sheets.Add (After = doc.Sheets [doc.Sheets.Count - 1])
+        sheet.Name = self.name
+        headers = [c.name for c in self.columns]
+        sheet.Range ("A1:%s1" % no_to_col (len (headers))).Value = headers
+        max = len (self.data)
+        for rn, row in enumerate (self.data) :
+            if not (rn % 100) :
+                print ("%6d/%6d" % (rn + 1, max))
+            data = [row [c.name] for c in self.columns]
+            sheet.Range ("A%d:%s%d" % (rn + 2, no_to_col (len (data)), rn + 2)).Value = data
+    # end def create_excel
+
+    def create_joined_execl (self, name, doc, i, joins, C) :
+        try :
+            sheet  = doc.Sheets [i]
+        except :
+            sheet  = doc.Sheets.Add (After = doc.Sheets [doc.Sheets.Count - 1])
+        try :
+            sheet.Name = name
+        except :
+            pass
+        headers    = [c.name for c in self.columns]
+        sep_cols   = [no_to_col (len (headers))]
+        max = len (self.data)
+        jdata = dict ()
+        for ji in joins.values () :
+            table = ji ["target"]
+            key   = ji ["key"]
+            data  = jdata [table.name] = dict ()
+            headers.extend (c.name for c in table.columns)
+            for row in table.data :
+                data [row [key]] = row
+            sep_cols.append (no_to_col (len (headers)))
+        sheet.Range    ("A1:%s1" % no_to_col (len (headers))).Value = headers
+        for rn, row in enumerate (self.data) :
+            if not (rn % 100) :
+                print ("%6d/%6d" % (rn + 1, max))
+            data  = [row [c.name] for c in self.columns]
+            jrows = {self : row}
+            for src, ji in joins.items () :
+                table             = ji ["target"]
+                key               = ji ["key"]
+                jrow              = jdata [table.name] [jrows [src] [key]]
+                jrows [table]     = jrow
+                data.extend (jrow [c.name] for c in table.columns)
+            row_spec = "A%d:%s%d" % (rn + 2, no_to_col (len (data)), rn + 2)
+            sheet.Range (row_spec).Value = data
+        for col  in sep_cols [:-1] :
+            srange = sheet.Range    ("%s1:%s%d" % (col, col, rn))
+            border = srange.Borders (C.xlEdgeRight)
+            border.LineStyle = C.xlContinuous
+            border.Weight    = C.xlMedium
+    # end def create_joined_execl
 
     def fill (self, engine) :
         ins = self._sql.insert ()
@@ -211,26 +279,57 @@ class VD_File (object) :
 
     def __init__ (self, vd_name) :
         self.file_name = vd_name
-        self.tables    = []
-        self.file      = self.File (open (vd_name, "r"))
+        self.tables    = OD                 ()
+        self.file      = self.File          (open (vd_name, "r"))
         line           = self.file.readline ()
         if line != "EX-IM" :
             raise ValueError ("Magic marker `EX_IM` not found!")
         while line != "-------------------------------------" :
             line = self.file.readline ().strip ()
         while self.file :
-            self.tables.append (Table.From_File (self.file))
+            table = Table.From_File (self.file)
+            self.tables [table.name] = table
     # end def __init__
 
     def create_database (self, engine) :
         metadata = sqlalchemy.MetaData ()
-        for t in self.tables :
+        for t in self.tables.values () :
             t.create        (metadata)
         metadata.create_all (engine)
     # end def create_database
 
+    def create_excel (self, file_name, create_joined = False) :
+        import win32com.client
+        e         = win32com.client.gencache.EnsureDispatch \
+                        ("Excel.Application")
+        from win32com.client import constants as C
+        e.Visible = True
+        doc       = e.Workbooks.Add ()
+        for i, table in enumerate (self.tables.values ()) :
+            print ("Dump %s" % (table.name, ))
+            table.create_excel (doc, i + 1)
+        if create_joined :
+            atom  = self.tables ["parameter_atomic_type"]
+            par_t = self.tables ["parameter_type"]
+            para  = self.tables ["parameter"]
+            dpara = self.tables ["device_parameter"]
+            obj   = self.tables ["communication_object"]
+            dobj  = self.tables ["device_object"]
+            joins = OD ()
+            joins [dpara] = dict (target = para,  key    = "PARAMETER_ID")
+            joins [para]  = dict (target = par_t, key    = "PARAMETER_TYPE_ID")
+            joins [par_t] = dict (target = atom,  key    = "ATOMIC_TYPE_NUMBER")
+            print ("Created joined table for parameters")
+            dpara.create_joined_execl ("Parameter Full", doc, i + 2, joins, C)
+            joins = OD ()
+            joins [dobj] = dict (target = obj, key = "OBJECT_ID")
+            print ("Created joined table for objects")
+            dobj.create_joined_execl ("Object Full", doc, i + 3, joins, C)
+        doc.SaveAs             (file_name)
+    # end def create_excel
+
     def fill (self, engine) :
-        for t in self.tables :
+        for t in self.tables.values () :
             t.fill (engine)
     # end def fill
 
@@ -254,10 +353,11 @@ if __name__ == "__main__" :
 
     sys.excepthook = info
     vd_file = VD_File (sys.argv [1])
-    engine  = sqlalchemy.create_engine \
-        ( "sqlite:///%s.sqlite" % (sys.argv [2], )
-        #, echo=True
-        )
-    vd_file.create_database (engine)
-    vd_file.fill            (engine)
+    #engine  = sqlalchemy.create_engine \
+    #    ( "sqlite:///%s.sqlite" % (sys.argv [2], )
+    #    #, echo=True
+    #    )
+    #vd_file.create_database (engine)
+    #vd_file.fill            (engine)
+    vd_file.create_excel     (sys.argv [2], True)
 ### __END__ VD2Sqlite
